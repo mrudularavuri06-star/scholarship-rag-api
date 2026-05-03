@@ -1,249 +1,118 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
 import pandas as pd
-import os
 import requests
 from bs4 import BeautifulSoup
-
-from langchain_core.documents import Document
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_community.vectorstores import FAISS
+import os
 
 # -----------------------------
-# CONFIG
+# INIT APP
 # -----------------------------
-DATA_PATH = "data/scholarships.csv"
-
-app = FastAPI(title="🎓 Scholarship Full RAG API")
-
-# -----------------------------
-# LOAD MODELS (ONCE)
-# -----------------------------
-embeddings = HuggingFaceEmbeddings(
-    model_name="sentence-transformers/all-MiniLM-L6-v2"
-)
-
-splitter = RecursiveCharacterTextSplitter(
-    chunk_size=600,
-    chunk_overlap=100
-)
-
-# -----------------------------
-# LOAD CSV DATA
-# -----------------------------
-def load_csv_docs():
-    docs = []
-
-    if not os.path.exists(DATA_PATH):
-        print("❌ CSV NOT FOUND")
-        return docs
-
-    df = pd.read_csv(DATA_PATH).fillna("")
-
-    for _, row in df.iterrows():
-        text = f"""
-Scholarship Name: {row.get('Name','')}
-Category: {row.get('Category','')}
-Income Limit: {row.get('Income_Limit','')}
-Minimum Marks: {row.get('Min_mark','')}
-Benefits: {row.get('Benefits','')}
-Deadline: {row.get('End_date','')}
-Apply Link: {row.get('Apply_link','')}
-Description: {row.get('Description','')}
-"""
-
-        docs.append(
-            Document(
-                page_content=text,
-                metadata={
-                    "name": row.get("Name", ""),
-                    "category": row.get("Category", ""),
-                    "income": row.get("Income_Limit", ""),
-                    "link": row.get("Apply_link", "")
-                }
-            )
-        )
-
-    return docs
-
-# -----------------------------
-# WEBSITE LOADER (FIXED)
-# -----------------------------
-def load_website(url):
-    try:
-        headers = {"User-Agent": "Mozilla/5.0"}
-        r = requests.get(url, headers=headers, timeout=10)
-
-        soup = BeautifulSoup(r.text, "html.parser")
-
-        for tag in soup(["script", "style"]):
-            tag.decompose()
-
-        text = " ".join(soup.get_text().split())
-
-        return [
-            Document(
-                page_content=text[:4000],
-                metadata={"source": url}
-            )
-        ]
-    except:
-        return []
-
-# -----------------------------
-# CREATE VECTOR DB
-# -----------------------------
-def create_db(docs):
-    chunks = splitter.split_documents(docs)
-    return FAISS.from_documents(chunks, embeddings)
+app = FastAPI(title="🎓 Scholarship RAG API")
 
 # -----------------------------
 # REQUEST MODEL
 # -----------------------------
 class QueryRequest(BaseModel):
     query: str
-    mode: str = "csv"
-    url: str = ""
+    mode: str = "csv"   # "csv" or "website"
+    url: str | None = None
+
 
 # -----------------------------
-# CSV ANSWER
+# LOAD CSV (SAFE PATH FOR RENDER)
 # -----------------------------
-def generate_csv_answer(results):
-    if not results:
-        return "No relevant scholarships found."
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CSV_PATH = os.path.join(BASE_DIR, "data", "scholarships.csv")
 
-    answer = f"Found {len(results)} scholarships:\n\n"
+try:
+    df = pd.read_csv(CSV_PATH)
+    df.fillna("", inplace=True)
+except Exception as e:
+    df = None
+    print("❌ CSV LOAD ERROR:", e)
 
-    for r in results:
-        name = r.metadata.get("name", "")
-        category = r.metadata.get("category", "")
-        income = r.metadata.get("income", "")
-
-        answer += f"- {name} (Category: {category}, Income: ₹{income})\n"
-
-    answer += "\nCheck links below for details."
-
-    return answer
 
 # -----------------------------
-# WEBSITE ANSWER (FINAL CLEAN)
+# CSV SEARCH FUNCTION
 # -----------------------------
-def generate_website_answer(results, query):
-    if not results:
-        return "No information found."
+def search_scholarships(query: str):
+    if df is None:
+        return "❌ CSV not loaded", []
 
-    context = " ".join([r.page_content for r in results])
+    query = query.lower()
 
-    sentences = [s.strip() for s in context.split(".")]
+    results = df[
+        df.apply(lambda row: query in str(row).lower(), axis=1)
+    ].head(5)
 
-    clean_sentences = []
-    for s in sentences:
-        s_lower = s.lower()
+    if results.empty:
+        return "❌ No scholarships found", []
 
-        if len(s) < 60:
-            continue
+    response = "Found scholarships:\n\n"
+    output = []
 
-        if any(x in s_lower for x in [
-            "see also",
-            "not to be confused",
-            "references",
-            "external links",
-            "citation",
-            "image",
-            "photo",
-            "depicts",
-            "young man",
-            "ceremony"
-        ]):
-            continue
+    for _, row in results.iterrows():
+        item = {
+            "name": row.get("name", ""),
+            "category": row.get("category", ""),
+            "income": str(row.get("income", "")),
+            "apply_link": row.get("apply_link", "")
+        }
 
-        clean_sentences.append(s)
+        response += f"- {item['name']} (Category: {item['category']}, Income: ₹{item['income']})\n"
+        output.append(item)
 
-    # PRIORITY: definition
-    definition_sentences = [
-        s for s in clean_sentences if "scholarship" in s.lower()
-    ]
+    return response, output
 
-    if definition_sentences:
-        best = definition_sentences[:2]
-    else:
-        query_words = query.lower().split()
-        ranked = []
-
-        for s in clean_sentences:
-            score = sum(word in s.lower() for word in query_words)
-            ranked.append((score, s))
-
-        ranked.sort(reverse=True)
-        best = [s for _, s in ranked[:2]]
-
-    if not best:
-        return context[:200]
-
-    answer = ". ".join(best)
-
-    if not answer.endswith("."):
-        answer += "."
-
-    return answer
 
 # -----------------------------
-# API ENDPOINT
+# WEBSITE MODE
+# -----------------------------
+def fetch_website(url: str):
+    try:
+        res = requests.get(url, timeout=10)
+        soup = BeautifulSoup(res.text, "lxml")
+
+        paragraphs = soup.find_all("p")
+        text = " ".join([p.get_text() for p in paragraphs])
+
+        return text[:2000]  # limit size
+
+    except Exception as e:
+        return f"❌ Error fetching website: {e}"
+
+
+# -----------------------------
+# MAIN ENDPOINT
 # -----------------------------
 @app.post("/ask")
 def ask(req: QueryRequest):
 
-    # -------- CSV MODE --------
+    # CSV MODE
     if req.mode == "csv":
-        docs = load_csv_docs()
-
-        if not docs:
-            return {"error": "CSV not found"}
-
-        db = create_db(docs)
-        results = db.similarity_search(req.query, k=5)
-
-        answer = generate_csv_answer(results)
-
-        structured = [
-            {
-                "name": r.metadata.get("name"),
-                "category": r.metadata.get("category"),
-                "income": r.metadata.get("income"),
-                "apply_link": r.metadata.get("link")
-            }
-            for r in results
-        ]
+        answer, results = search_scholarships(req.query)
 
         return {
             "mode": "csv",
             "query": req.query,
             "answer": answer,
-            "results": structured
+            "results": results
         }
 
-    # -------- WEBSITE MODE --------
+    # WEBSITE MODE
     elif req.mode == "website":
         if not req.url:
-            return {"error": "URL required"}
+            return {"error": "URL required for website mode"}
 
-        docs = load_website(req.url)
-
-        if not docs:
-            return {"error": "Failed to load website"}
-
-        db = create_db(docs)
-        results = db.similarity_search(req.query, k=3)
-
-        answer = generate_website_answer(results, req.query)
+        text = fetch_website(req.url)
 
         return {
             "mode": "website",
             "query": req.query,
-            "answer": answer,
+            "answer": text,
             "source": req.url
         }
 
-    else:
-        return {"error": "Invalid mode"}
+    # INVALID MODE
+    return {"error": "Invalid mode"}
