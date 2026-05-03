@@ -1,118 +1,46 @@
 from fastapi import FastAPI
-from pydantic import BaseModel
 import pandas as pd
 import requests
 from bs4 import BeautifulSoup
-import os
 
-# -----------------------------
-# INIT APP
-# -----------------------------
-app = FastAPI(title="🎓 Scholarship RAG API")
+app = FastAPI()
 
-# -----------------------------
-# REQUEST MODEL
-# -----------------------------
-class QueryRequest(BaseModel):
-    query: str
-    mode: str = "csv"   # "csv" or "website"
-    url: str | None = None
-
-
-# -----------------------------
-# LOAD CSV (SAFE PATH FOR RENDER)
-# -----------------------------
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-CSV_PATH = os.path.join(BASE_DIR, "data", "scholarships.csv")
-
+# Load CSV once
 try:
-    df = pd.read_csv(CSV_PATH)
-    df.fillna("", inplace=True)
-except Exception as e:
+    df = pd.read_csv("data/scholarships.csv")
+except:
     df = None
-    print("❌ CSV LOAD ERROR:", e)
 
 
-# -----------------------------
-# CSV SEARCH FUNCTION
-# -----------------------------
+@app.get("/")
+def home():
+    return {"message": "Scholarship API is running 🚀"}
+
+
+@app.get("/scholarships")
+def get_scholarships():
+    if df is None:
+        return {"error": "CSV not loaded"}
+    return df.head(10).to_dict(orient="records")
+
+
+@app.get("/search")
 def search_scholarships(query: str):
     if df is None:
-        return "❌ CSV not loaded", []
+        return {"error": "CSV not loaded"}
 
-    query = query.lower()
-
-    results = df[
-        df.apply(lambda row: query in str(row).lower(), axis=1)
-    ].head(5)
-
-    if results.empty:
-        return "❌ No scholarships found", []
-
-    response = "Found scholarships:\n\n"
-    output = []
-
-    for _, row in results.iterrows():
-        item = {
-            "name": row.get("name", ""),
-            "category": row.get("category", ""),
-            "income": str(row.get("income", "")),
-            "apply_link": row.get("apply_link", "")
-        }
-
-        response += f"- {item['name']} (Category: {item['category']}, Income: ₹{item['income']})\n"
-        output.append(item)
-
-    return response, output
+    results = df[df.apply(lambda row: query.lower() in str(row).lower(), axis=1)]
+    return results.head(10).to_dict(orient="records")
 
 
-# -----------------------------
-# WEBSITE MODE
-# -----------------------------
-def fetch_website(url: str):
+@app.get("/scrape")
+def scrape_scholarships(url: str):
     try:
-        res = requests.get(url, timeout=10)
-        soup = BeautifulSoup(res.text, "lxml")
+        response = requests.get(url)
+        soup = BeautifulSoup(response.text, "lxml")
 
-        paragraphs = soup.find_all("p")
-        text = " ".join([p.get_text() for p in paragraphs])
+        links = [a.text for a in soup.find_all("a")[:20]]
 
-        return text[:2000]  # limit size
-
+        return {"data": links}
     except Exception as e:
-        return f"❌ Error fetching website: {e}"
-
-
-# -----------------------------
-# MAIN ENDPOINT
-# -----------------------------
-@app.post("/ask")
-def ask(req: QueryRequest):
-
-    # CSV MODE
-    if req.mode == "csv":
-        answer, results = search_scholarships(req.query)
-
-        return {
-            "mode": "csv",
-            "query": req.query,
-            "answer": answer,
-            "results": results
-        }
-
-    # WEBSITE MODE
-    elif req.mode == "website":
-        if not req.url:
-            return {"error": "URL required for website mode"}
-
-        text = fetch_website(req.url)
-
-        return {
-            "mode": "website",
-            "query": req.query,
-            "answer": text,
-            "source": req.url
-        }
-
-    # INVALID MODE
-    return {"error": "Invalid mode"}
+        return {"error": str(e)}
