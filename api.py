@@ -1,5 +1,5 @@
+from fastapi.middleware.cors import CORSMiddleware 
 from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import pandas as pd
 import os
@@ -12,8 +12,6 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 
-from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
-
 # -----------------------------
 # CONFIG
 # -----------------------------
@@ -22,11 +20,11 @@ DATA_PATH = "data/scholarships.csv"
 # -----------------------------
 # APP INIT
 # -----------------------------
-app = FastAPI(title="🎓 Scholarship LLM RAG API")
+app = FastAPI(title="🎓 Scholarship Full RAG API")
 
 @app.get("/")
 def home():
-    return {"message": "LLM-powered Scholarship RAG API is running 🚀"}
+    return {"message": "Scholarship RAG API is running 🚀"}
 
 @app.get("/health")
 def health():
@@ -50,11 +48,9 @@ logging.basicConfig(level=logging.INFO)
 # -----------------------------
 embeddings = None
 db_cache = None
-llm_tokenizer = None
-llm_model = None
 
 # -----------------------------
-# LOAD EMBEDDINGS (LAZY)
+# LOAD EMBEDDINGS (LAZY LOAD)
 # -----------------------------
 def get_embeddings():
     global embeddings
@@ -64,21 +60,6 @@ def get_embeddings():
             model_name="sentence-transformers/all-MiniLM-L6-v2"
         )
     return embeddings
-
-# -----------------------------
-# LOAD LLM (LAZY)
-# -----------------------------
-def get_llm():
-    global llm_tokenizer, llm_model
-
-    if llm_model is None:
-        logging.info("🔄 Loading LLM model...")
-        model_name = "google/flan-t5-small"
-
-        llm_tokenizer = AutoTokenizer.from_pretrained(model_name)
-        llm_model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
-
-    return llm_tokenizer, llm_model
 
 # -----------------------------
 # TEXT SPLITTER
@@ -178,46 +159,6 @@ def get_csv_db():
     return db_cache
 
 # -----------------------------
-# LLM ANSWER GENERATION
-# -----------------------------
-def generate_llm_answer(query, docs):
-    if not docs:
-        return "No relevant information found."
-
-    tokenizer, model = get_llm()
-
-    context = "\n\n".join([d.page_content for d in docs[:5]])
-
-    prompt = f"""
-You are a helpful scholarship assistant.
-
-Instructions:
-- Answer ONLY from the context
-- If not found, say "I don't know"
-- Keep answers clear and structured
-- Mention scholarship names if available
-
-Context:
-{context}
-
-Question:
-{query}
-
-Answer:
-"""
-
-    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=1024)
-
-    outputs = model.generate(
-        **inputs,
-        max_new_tokens=200,
-        temperature=0.3
-    )
-
-    answer = tokenizer.decode(outputs[0], skip_special_tokens=True)
-    return answer
-
-# -----------------------------
 # REQUEST MODEL
 # -----------------------------
 class QueryRequest(BaseModel):
@@ -226,62 +167,126 @@ class QueryRequest(BaseModel):
     url: str = ""
 
 # -----------------------------
+# CSV ANSWER
+# -----------------------------
+def generate_csv_answer(results):
+    if not results:
+        return "No relevant scholarships found."
+
+    answer = f"Found {len(results)} scholarships:\n\n"
+
+    for r in results:
+        name = r.metadata.get("name", "")
+        category = r.metadata.get("category", "")
+        income = r.metadata.get("income", "")
+
+        answer += f"- {name} (Category: {category}, Income: ₹{income})\n"
+
+    answer += "\nCheck links below for details."
+    return answer
+
+# -----------------------------
+# WEBSITE ANSWER
+# -----------------------------
+def generate_website_answer(results, query):
+    if not results:
+        return "No information found."
+
+    context = " ".join([r.page_content for r in results])
+    sentences = [s.strip() for s in context.split(".")]
+
+    clean_sentences = []
+    for s in sentences:
+        s_lower = s.lower()
+
+        if len(s) < 60:
+            continue
+
+        if any(x in s_lower for x in [
+            "see also", "references", "external links",
+            "citation", "image", "photo"
+        ]):
+            continue
+
+        clean_sentences.append(s)
+
+    definition = [s for s in clean_sentences if "scholarship" in s.lower()]
+
+    if definition:
+        best = definition[:2]
+    else:
+        query_words = query.lower().split()
+        ranked = []
+
+        for s in clean_sentences:
+            score = sum(word in s.lower() for word in query_words)
+            ranked.append((score, s))
+
+        ranked.sort(reverse=True)
+        best = [s for _, s in ranked[:2]]
+
+    if not best:
+        return context[:200]
+
+    answer = ". ".join(best)
+
+    if not answer.endswith("."):
+        answer += "."
+
+    return answer
+
+# -----------------------------
 # API ENDPOINT
 # -----------------------------
 @app.post("/ask")
 def ask(req: QueryRequest):
 
-    try:
-        if req.mode == "csv":
-            db = get_csv_db()
+    if req.mode == "csv":
+        db = get_csv_db()
 
-            if db is None:
-                return {"error": "CSV not found"}
+        if db is None:
+            return {"error": "CSV not found"}
 
-            results = db.similarity_search(req.query, k=5)
-            answer = generate_llm_answer(req.query, results)
+        results = db.similarity_search(req.query, k=5)
+        answer = generate_csv_answer(results)
 
-            structured = [
-                {
-                    "name": r.metadata.get("name"),
-                    "category": r.metadata.get("category"),
-                    "income": r.metadata.get("income"),
-                    "apply_link": r.metadata.get("link")
-                }
-                for r in results
-            ]
-
-            return {
-                "mode": "csv",
-                "query": req.query,
-                "answer": answer,
-                "results": structured
+        structured = [
+            {
+                "name": r.metadata.get("name"),
+                "category": r.metadata.get("category"),
+                "income": r.metadata.get("income"),
+                "apply_link": r.metadata.get("link")
             }
+            for r in results
+        ]
 
-        elif req.mode == "website":
-            if not req.url:
-                return {"error": "URL required"}
+        return {
+            "mode": "csv",
+            "query": req.query,
+            "answer": answer,
+            "results": structured
+        }
 
-            docs = load_website(req.url)
+    elif req.mode == "website":
+        if not req.url:
+            return {"error": "URL required"}
 
-            if not docs:
-                return {"error": "Failed to load website"}
+        docs = load_website(req.url)
 
-            db = create_db(docs)
-            results = db.similarity_search(req.query, k=3)
+        if not docs:
+            return {"error": "Failed to load website"}
 
-            answer = generate_llm_answer(req.query, results)
+        db = create_db(docs)
+        results = db.similarity_search(req.query, k=3)
 
-            return {
-                "mode": "website",
-                "query": req.query,
-                "answer": answer,
-                "source": req.url
-            }
+        answer = generate_website_answer(results, req.query)
 
-        else:
-            return {"error": "Invalid mode"}
+        return {
+            "mode": "website",
+            "query": req.query,
+            "answer": answer,
+            "source": req.url
+        }
 
-    except Exception as e:
-        logging.error(f"❌ API Error: {e}")
-        return {"error": "Something went wrong"}
+    else:
+        return {"error": "Invalid mode"}  
