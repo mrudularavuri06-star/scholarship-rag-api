@@ -50,12 +50,12 @@ embeddings = None
 db_cache = None
 
 # -----------------------------
-# LOAD EMBEDDINGS
+# LOAD EMBEDDINGS (LAZY)
 # -----------------------------
 def get_embeddings():
     global embeddings
     if embeddings is None:
-        logging.info("Loading embeddings model...")
+        logging.info("⚡ Loading embeddings model...")
         embeddings = HuggingFaceEmbeddings(
             model_name="sentence-transformers/all-MiniLM-L6-v2"
         )
@@ -141,7 +141,7 @@ def create_db(docs):
     return FAISS.from_documents(chunks, get_embeddings())
 
 # -----------------------------
-# CACHE CSV DB
+# CACHE CSV DB (LAZY LOAD)
 # -----------------------------
 def get_csv_db():
     global db_cache
@@ -149,7 +149,7 @@ def get_csv_db():
     if db_cache is not None:
         return db_cache
 
-    logging.info("Creating FAISS DB from CSV...")
+    logging.info("⚡ Creating FAISS DB from CSV...")
     docs = load_csv_docs()
 
     if not docs:
@@ -236,21 +236,12 @@ def generate_website_answer(results, query):
     return answer
 
 # -----------------------------
-# STARTUP LOAD
-# -----------------------------
-@app.on_event("startup")
-def startup_event():
-    logging.info("🚀 App starting...")
-    get_embeddings()
-    get_csv_db()
-
-# -----------------------------
 # API ENDPOINT
 # -----------------------------
 @app.post("/ask")
 def ask(req: QueryRequest):
 
-    # -------- CSV MODE --------
+    # CSV MODE
     if req.mode == "csv":
         db = get_csv_db()
 
@@ -277,7 +268,7 @@ def ask(req: QueryRequest):
             "results": structured
         }
 
-    # -------- WEBSITE MODE --------
+    # WEBSITE MODE
     elif req.mode == "website":
         if not req.url:
             return {"error": "URL required"}
