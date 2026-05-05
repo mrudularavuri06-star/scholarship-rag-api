@@ -50,12 +50,12 @@ embeddings = None
 db_cache = None
 
 # -----------------------------
-# LOAD EMBEDDINGS (LAZY)
+# LOAD EMBEDDINGS
 # -----------------------------
 def get_embeddings():
     global embeddings
     if embeddings is None:
-        logging.info("⚡ Loading embeddings model...")
+        logging.info("🧠 Loading embeddings model...")
         embeddings = HuggingFaceEmbeddings(
             model_name="sentence-transformers/all-MiniLM-L6-v2"
         )
@@ -75,11 +75,16 @@ splitter = RecursiveCharacterTextSplitter(
 def load_csv_docs():
     docs = []
 
+    logging.info(f"📂 Looking for CSV at: {DATA_PATH}")
+
     if not os.path.exists(DATA_PATH):
         logging.error("❌ CSV NOT FOUND")
         return docs
 
-    df = pd.read_csv(DATA_PATH).fillna("")
+    # LIMIT rows for faster performance (important for Render)
+    df = pd.read_csv(DATA_PATH).fillna("").head(50)
+
+    logging.info(f"📊 Loaded {len(df)} rows from CSV")
 
     for _, row in df.iterrows():
         text = f"""
@@ -137,8 +142,14 @@ def load_website(url):
 # CREATE VECTOR DB
 # -----------------------------
 def create_db(docs):
+    logging.info(f"📄 Splitting {len(docs)} documents...")
     chunks = splitter.split_documents(docs)
-    return FAISS.from_documents(chunks, get_embeddings())
+
+    logging.info(f"🧠 Creating embeddings for {len(chunks)} chunks...")
+    db = FAISS.from_documents(chunks, get_embeddings())
+
+    logging.info("✅ FAISS DB created successfully")
+    return db
 
 # -----------------------------
 # CACHE CSV DB (LAZY LOAD)
@@ -149,10 +160,12 @@ def get_csv_db():
     if db_cache is not None:
         return db_cache
 
-    logging.info("⚡ Creating FAISS DB from CSV...")
+    logging.info("📦 Creating FAISS DB from CSV (lazy load)...")
+
     docs = load_csv_docs()
 
     if not docs:
+        logging.error("❌ No documents loaded from CSV")
         return None
 
     db_cache = create_db(docs)
@@ -236,17 +249,24 @@ def generate_website_answer(results, query):
     return answer
 
 # -----------------------------
+# STARTUP (LIGHTWEIGHT)
+# -----------------------------
+@app.on_event("startup")
+def startup_event():
+    logging.info("🚀 App starting... (light mode)")
+
+# -----------------------------
 # API ENDPOINT
 # -----------------------------
 @app.post("/ask")
 def ask(req: QueryRequest):
 
-    # CSV MODE
+    # -------- CSV MODE --------
     if req.mode == "csv":
         db = get_csv_db()
 
         if db is None:
-            return {"error": "CSV not found"}
+            return {"error": "CSV not found or failed to load"}
 
         results = db.similarity_search(req.query, k=5)
         answer = generate_csv_answer(results)
@@ -268,7 +288,7 @@ def ask(req: QueryRequest):
             "results": structured
         }
 
-    # WEBSITE MODE
+    # -------- WEBSITE MODE --------
     elif req.mode == "website":
         if not req.url:
             return {"error": "URL required"}
