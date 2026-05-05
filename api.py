@@ -1,11 +1,10 @@
-from fastapi.middleware.cors import CORSMiddleware 
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi import FastAPI
 from pydantic import BaseModel
 import pandas as pd
 import os
 import requests
 from bs4 import BeautifulSoup
-import logging
 
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -17,18 +16,11 @@ from langchain_community.vectorstores import FAISS
 # -----------------------------
 DATA_PATH = "data/scholarships.csv"
 
-# -----------------------------
-# APP INIT
-# -----------------------------
 app = FastAPI(title="🎓 Scholarship Full RAG API")
 
 @app.get("/")
 def home():
     return {"message": "Scholarship RAG API is running 🚀"}
-
-@app.get("/health")
-def health():
-    return {"status": "ok"}
 
 app.add_middleware(
     CORSMiddleware,
@@ -39,31 +31,18 @@ app.add_middleware(
 )
 
 # -----------------------------
-# LOGGING
-# -----------------------------
-logging.basicConfig(level=logging.INFO)
-
-# -----------------------------
-# GLOBAL CACHE
+# LOAD MODELS (ONCE)
 # -----------------------------
 embeddings = None
-db_cache = None
 
-# -----------------------------
-# LOAD EMBEDDINGS (LAZY LOAD)
-# -----------------------------
 def get_embeddings():
     global embeddings
     if embeddings is None:
-        logging.info("🔄 Loading embeddings model...")
         embeddings = HuggingFaceEmbeddings(
             model_name="sentence-transformers/all-MiniLM-L6-v2"
         )
     return embeddings
 
-# -----------------------------
-# TEXT SPLITTER
-# -----------------------------
 splitter = RecursiveCharacterTextSplitter(
     chunk_size=600,
     chunk_overlap=100
@@ -76,7 +55,7 @@ def load_csv_docs():
     docs = []
 
     if not os.path.exists(DATA_PATH):
-        logging.error(f"❌ CSV NOT FOUND at {DATA_PATH}")
+        print("❌ CSV NOT FOUND")
         return docs
 
     df = pd.read_csv(DATA_PATH).fillna("")
@@ -108,7 +87,7 @@ Description: {row.get('Description','')}
     return docs
 
 # -----------------------------
-# WEBSITE LOADER
+# WEBSITE LOADER (FIXED)
 # -----------------------------
 def load_website(url):
     try:
@@ -128,9 +107,7 @@ def load_website(url):
                 metadata={"source": url}
             )
         ]
-
-    except Exception as e:
-        logging.error(f"Website load error: {e}")
+    except:
         return []
 
 # -----------------------------
@@ -139,24 +116,6 @@ def load_website(url):
 def create_db(docs):
     chunks = splitter.split_documents(docs)
     return FAISS.from_documents(chunks, get_embeddings())
-
-# -----------------------------
-# CACHE CSV DB (LAZY)
-# -----------------------------
-def get_csv_db():
-    global db_cache
-
-    if db_cache is not None:
-        return db_cache
-
-    logging.info("🔄 Creating FAISS DB from CSV...")
-    docs = load_csv_docs()
-
-    if not docs:
-        return None
-
-    db_cache = create_db(docs)
-    return db_cache
 
 # -----------------------------
 # REQUEST MODEL
@@ -183,16 +142,18 @@ def generate_csv_answer(results):
         answer += f"- {name} (Category: {category}, Income: ₹{income})\n"
 
     answer += "\nCheck links below for details."
+
     return answer
 
 # -----------------------------
-# WEBSITE ANSWER
+# WEBSITE ANSWER (FINAL CLEAN)
 # -----------------------------
 def generate_website_answer(results, query):
     if not results:
         return "No information found."
 
     context = " ".join([r.page_content for r in results])
+
     sentences = [s.strip() for s in context.split(".")]
 
     clean_sentences = []
@@ -203,17 +164,28 @@ def generate_website_answer(results, query):
             continue
 
         if any(x in s_lower for x in [
-            "see also", "references", "external links",
-            "citation", "image", "photo"
+            "see also",
+            "not to be confused",
+            "references",
+            "external links",
+            "citation",
+            "image",
+            "photo",
+            "depicts",
+            "young man",
+            "ceremony"
         ]):
             continue
 
         clean_sentences.append(s)
 
-    definition = [s for s in clean_sentences if "scholarship" in s.lower()]
+    # PRIORITY: definition
+    definition_sentences = [
+        s for s in clean_sentences if "scholarship" in s.lower()
+    ]
 
-    if definition:
-        best = definition[:2]
+    if definition_sentences:
+        best = definition_sentences[:2]
     else:
         query_words = query.lower().split()
         ranked = []
@@ -241,13 +213,16 @@ def generate_website_answer(results, query):
 @app.post("/ask")
 def ask(req: QueryRequest):
 
+    # -------- CSV MODE --------
     if req.mode == "csv":
-        db = get_csv_db()
+        docs = load_csv_docs()
 
-        if db is None:
+        if not docs:
             return {"error": "CSV not found"}
 
+        db = create_db(docs)
         results = db.similarity_search(req.query, k=5)
+
         answer = generate_csv_answer(results)
 
         structured = [
@@ -267,6 +242,7 @@ def ask(req: QueryRequest):
             "results": structured
         }
 
+    # -------- WEBSITE MODE --------
     elif req.mode == "website":
         if not req.url:
             return {"error": "URL required"}
@@ -289,4 +265,4 @@ def ask(req: QueryRequest):
         }
 
     else:
-        return {"error": "Invalid mode"}  
+        return {"error": "Invalid mode"}
